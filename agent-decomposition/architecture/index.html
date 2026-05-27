@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>StockPilot 架构拆解 · Before vs After</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- ──────────────────────────── HERO ──────────────────────────── -->
+<header class="hero">
+  <div class="wrap">
+    <p class="kicker">workshop · agent-decomposition · 架构解读</p>
+    <h1>把一个 402 行的提示词，<br/>拆成一支 Agent 团队。</h1>
+    <p class="lede">
+      StockPilot 是一个中型户外装备零售商的库存管理 Agent。
+      它管 250 个 SKU、3 个仓库、12 家供应商、90 天销售历史。
+      v1（Before）把所有业务规则都写进 system prompt，配 12 个工具和 3 个硬编码 subagent。
+      v2（After）把同样的知识改写成 5 个按需加载的 skill、几个可执行脚本和一个 callable forecaster。
+      本页给两类读者看：
+      <strong>供应链从业者</strong>看的是业务规则去了哪里；
+      <strong>IT/Agent 开发者</strong>看的是这套架构是怎么被组装出来的。
+    </p>
+
+    <div class="stat-strip" data-anim="counters">
+      <div class="stat">
+        <span class="big" data-from="71" data-to="92" data-suffix="%">71%</span>
+        <span class="lbl">eval 通过率</span>
+      </div>
+      <div class="stat">
+        <span class="big" data-from="402" data-to="15" data-suffix=" 行">402 行</span>
+        <span class="lbl">system prompt</span>
+      </div>
+      <div class="stat">
+        <span class="big" data-from="102" data-to="3" data-suffix=" 次">102 次</span>
+        <span class="lbl">F1 任务工具调用</span>
+      </div>
+      <div class="stat">
+        <span class="big" data-from="488" data-to="100" data-suffix=" 秒">488 秒</span>
+        <span class="lbl">F1 任务壁时</span>
+      </div>
+    </div>
+
+    <nav class="toc">
+      <a href="#biz">①&nbsp;这是个什么生意</a>
+      <a href="#cheatsheet">②&nbsp;供应链术语对照</a>
+      <a href="#framework">③&nbsp;三档决策框架</a>
+      <a href="#before">④&nbsp;Before 架构</a>
+      <a href="#after">⑤&nbsp;After 架构</a>
+      <a href="#fate">⑥&nbsp;12 个工具的命运</a>
+      <a href="#policy">⑦&nbsp;业务策略搬家路线</a>
+      <a href="#principles">⑧&nbsp;四条设计原则</a>
+      <a href="#f1">⑨&nbsp;F1 任务对比</a>
+      <a href="#takeaway">⑩&nbsp;给你的 takeaway</a>
+    </nav>
+  </div>
+</header>
+
+
+<!-- ─────────────────── ① 这是个什么生意 ─────────────────── -->
+<section id="biz" class="section">
+  <div class="wrap">
+    <h2><span class="num">①</span>这是个什么生意</h2>
+    <p class="intro">
+      在写任何 agent 之前，先看清它要服务的业务对象。这不是"几个 SKU 的玩具"——
+      它的规模足够让"该不该再下一单"这种小决策每天发生几十次，而每次决策的错都直接掉收入或压库存。
+    </p>
+
+    <div class="biz-grid">
+      <div class="biz-card"><div class="num-big">250</div><div class="lbl">SKU（在售商品）</div><p>从登山杖到睡袋到头灯，每个有自己的补货点和季节性。</p></div>
+      <div class="biz-card"><div class="num-big">3</div><div class="lbl">仓库</div><p>WH-EAST（Carlisle, PA）/ WH-WEST（Reno, NV）/ WH-CENTRAL（Kansas City, MO）。同一 SKU 在三处的库存独立计量。</p></div>
+      <div class="biz-card"><div class="num-big">12</div><div class="lbl">供应商</div><p>价格、交付周期、可靠性、MOQ 各不同。还有目录之外的"潜规则"（节假日歇业、品类短发、阶梯折扣）。</p></div>
+      <div class="biz-card"><div class="num-big">90 天</div><div class="lbl">销售历史</div><p>用来算速度、识别趋势、对比促销同期。本身大约 6.7 万行。</p></div>
+    </div>
+
+    <h3 class="hdr">Agent 要负责的 7 件事</h3>
+    <p class="hint">这 7 张卡来自 workshop 首页截图，是 v1 实际承担的业务面。</p>
+    <div class="cap-grid">
+      <article class="cap-card" data-cap="monitor">
+        <h4>① 监控与告警</h4>
+        <p>盯库存水平，把跌破补货点的 SKU 浮出水面。</p>
+        <details><summary>业务含义</summary>
+          <p>当某 SKU 在某仓库的 <code>on_hand &lt; reorder_point</code>，触发评估。
+          紧急程度按 <code>days_of_cover = on_hand / 日均销量</code> 排序；
+          覆盖天数 &lt; 供应商交付周期 = 在 PO 到货前必断货。</p>
+        </details>
+      </article>
+      <article class="cap-card" data-cap="forecast">
+        <h4>② 需求预测</h4>
+        <p>尤其在促销和季节切换时。</p>
+        <details><summary>业务含义</summary>
+          <p>普通日子用 14 天滚动均值即可；遇促销、季节、长 horizon，需要看全 90 天历史寻找类比。
+          预测必须给出置信度——下游凭它决定"自动下单"还是"升级人工"。</p>
+        </details>
+      </article>
+      <article class="cap-card" data-cap="supplier">
+        <h4>③ 选供应商</h4>
+        <p>价格 vs 交付周期 vs 可靠性。</p>
+        <details><summary>业务含义</summary>
+          <p>分数 = 0.5×（1−归一化价格）+ 0.3×（1−归一化交付周期）+ 0.2×可靠性。
+          但目录之外的规则（如 SUP-04 满 250 件 3% 折扣、SUP-02 年末歇业）要手动覆盖。</p>
+        </details>
+      </article>
+      <article class="cap-card" data-cap="po">
+        <h4>④ 下单</h4>
+        <p>创建 PO、更新 ERP。</p>
+        <details><summary>业务含义</summary>
+          <p>补货量 = 日均销量 × 30 + 安全库存 − 当前在手。
+          向上取整到供应商 MOQ。低于 MOQ 的单会被拒。</p>
+        </details>
+      </article>
+      <article class="cap-card" data-cap="notify">
+        <h4>⑤ 通知运营</h4>
+        <p>Slack 告警、供应商邮件。</p>
+        <details><summary>业务含义</summary>
+          <p>例行补货发 #ops-inventory 频道；紧急或大额走升级矩阵（采购主管 / 财务）。
+          巡检时<strong>发一条汇总</strong>，而不是每个 SKU 一条。</p>
+        </details>
+      </article>
+      <article class="cap-card" data-cap="report">
+        <h4>⑥ 周报</h4>
+        <p>每周一为每个仓库出一份。</p>
+        <details><summary>业务含义</summary>
+          <p>含本仓最关注项、超过交付周期的未关闭 PO、连续 5 个工作日以上低于补货点的 SKU。
+          领导看的是趋势，不是事件。</p>
+        </details>
+      </article>
+      <article class="cap-card" data-cap="disrupt">
+        <h4>⑦ 监测外部中断</h4>
+        <p>港口延误、物流新闻。</p>
+        <details><summary>业务含义</summary>
+          <p>会影响交付周期判断——尤其依赖进口的 SUP-07。
+          v2 直接把这个能力拿掉了：它本属于另一个独立的"市场情报" agent。</p>
+        </details>
+      </article>
+    </div>
+
+    <h3 class="hdr">数据底盘：6 个文件就是真相</h3>
+    <p class="hint">在沙箱里以 CSV / JSONL 形式存在。所有 agent 决策最终都要落到这几张表。</p>
+    <div id="data-schema" class="schema-wrap"></div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ② 供应链术语对照 ─────────────────── -->
+<section id="cheatsheet" class="section alt">
+  <div class="wrap">
+    <h2><span class="num">②</span>供应链术语对照（给 IT 读者）</h2>
+    <p class="intro">如果你来自 IT、不熟悉供应链，先把这几个词理解清楚，后面的架构图就好懂了。</p>
+    <div class="terms" id="terms"></div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ③ 三档决策框架 ─────────────────── -->
+<section id="framework" class="section">
+  <div class="wrap">
+    <h2><span class="num">③</span>三档决策框架：tool → skill → subagent</h2>
+    <p class="intro">
+      这是这场 workshop 的核心心智模型。当你想给 agent 加一个能力时，先想清楚它属于哪一档——
+      <strong>越往右越强，但越贵</strong>。Before agent 的问题不是"哪档不对"，而是把好几样东西放错了档位。
+    </p>
+
+    <div class="framework-grid">
+      <article class="fw-card tool">
+        <header><span class="tag">最便宜</span><h3>Tool Call</h3></header>
+        <p class="role">一个无状态函数。Agent 用一次。</p>
+        <ul>
+          <li>输入参数化、输出固定结构</li>
+          <li>确定性强、可单测</li>
+          <li>主成本：每次的 token 进上下文</li>
+        </ul>
+        <p class="case"><strong>典型例：</strong> <code>get_stock_level(sku, warehouse)</code> 这种"查一个值"。</p>
+        <p class="smell">⚠ <strong>气味：</strong>返回 &gt; 2k tokens？换成代码执行。</p>
+      </article>
+
+      <article class="fw-card skill">
+        <header><span class="tag">按需加载</span><h3>Skill</h3></header>
+        <p class="role">一段"什么时候触发 + 怎么做"的说明，可附带可执行脚本。</p>
+        <ul>
+          <li>不在常驻 system prompt 里付 token</li>
+          <li>Description 命中关键词才加载</li>
+          <li>把<strong>策略</strong>从 prompt 抽离</li>
+        </ul>
+        <p class="case"><strong>典型例：</strong> 补货公式、供应商打分权重、告警模板。</p>
+        <p class="smell">⚠ <strong>气味：</strong>正在 prompt 里写"always do X before Y"？改 skill。</p>
+      </article>
+
+      <article class="fw-card sub">
+        <header><span class="tag">最贵</span><h3>Subagent</h3></header>
+        <p class="role">独立的 agent，拥有自己的 context window 和目标。</p>
+        <ul>
+          <li>能隔离大数据/长推理</li>
+          <li>返回结构化结果</li>
+          <li>主成本：模型一整次完整启动</li>
+        </ul>
+        <p class="case"><strong>典型例：</strong> Forecaster 要看完整 90 天历史。</p>
+        <p class="smell">⚠ <strong>气味：</strong>subagent 输出是一个数字？它不该是 subagent。</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ④ Before 架构 ─────────────────── -->
+<section id="before" class="section dark">
+  <div class="wrap">
+    <h2><span class="num">④</span>Before 架构（v1，2025 年的样子）</h2>
+    <p class="intro">
+      运行在原生 Messages API 上的手写 agent loop。一个 402 行的 system prompt 把所有业务规则塞进去，
+      12 个工具直接读 CSV，3 个 subagent 用<strong>散文</strong>回话再由主 agent 解析。每一处单看都合理，问题在于<strong>聚合</strong>。
+    </p>
+
+    <div id="diagram-before" class="diagram"></div>
+
+    <div class="two-col">
+      <div class="col">
+        <h3 class="hdr">12 个工具（一段时间内每月新增 1–2 个）</h3>
+        <ul id="legacy-tools" class="list-mono"></ul>
+      </div>
+      <div class="col">
+        <h3 class="hdr">3 个硬编码 subagent</h3>
+        <ul id="legacy-subagents" class="list-mono"></ul>
+        <p class="hint">实现见 <code>agents/before/subagents.py</code>。每个都是独立的 Messages API 调用，<strong>返回散文</strong>，主 agent 自己从文本里抽数字。</p>
+      </div>
+    </div>
+
+    <h3 class="hdr">402 行 prompt 在写些什么？</h3>
+    <p class="hint">把整份 prompt 按章节拆开看，知识密度极高但<strong>常驻 context</strong>——每一轮模型调用都要付一次 token。</p>
+    <div id="prompt-anatomy" class="prompt-bars"></div>
+
+    <h3 class="hdr">为什么 v1 跑 F1 任务要 102 次工具调用？</h3>
+    <p class="hint">F1 = 每日低库存巡检。看 agent 在 v1 架构下被迫怎么做：</p>
+    <div id="before-trace" class="trace"></div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ⑤ After 架构 ─────────────────── -->
+<section id="after" class="section">
+  <div class="wrap">
+    <h2><span class="num">⑤</span>After 架构（v2，部署到 Claude Managed Agents）</h2>
+    <p class="intro">
+      短 prompt + <code>agent_toolset</code>（Bash、文件读写、Task）+ 5 个按需加载的 skill +
+      1 个 callable forecaster。这套 setup 把"知识"和"算力"重新分配：常驻 context 只剩 15 行，
+      400 行的 skill 内容只在被用到时进 context。
+    </p>
+
+    <div id="diagram-after" class="diagram"></div>
+
+    <div class="two-col">
+      <div class="col">
+        <h3 class="hdr">5 个 skill（按需触发，平时不进 context）</h3>
+        <ul id="skills-list" class="list-mono"></ul>
+      </div>
+      <div class="col">
+        <h3 class="hdr">1 个 callable forecaster</h3>
+        <p>
+          一个独立的子 agent，<strong>仅在需要看完整 90 天历史时</strong>被调用。
+          主 agent 只发出 SKU、产品标志、horizon 三个参数；
+          forecaster 在自己的 context 里跑 Bash 算预测，<strong>只把 4 字段 JSON 返回</strong>。
+        </p>
+        <pre class="snippet">{
+  "forecast_qty": 2100,
+  "confidence": 0.41,
+  "method": "baseline_mean_no_comparable_promo",
+  "flags": ["promo_uplift_uncertain"]
+}</pre>
+        <p class="hint">这就是<strong>typed contract</strong>原则。主 agent 用 <code>confidence &lt; 0.6</code> 这个阈值决定下单还是升级。</p>
+      </div>
+    </div>
+
+    <h3 class="hdr">15 行的 SHORT_PROMPT 长什么样</h3>
+    <pre class="snippet wide" id="short-prompt"></pre>
+
+    <h3 class="hdr">F1 任务在 v2 架构下怎么跑？</h3>
+    <p class="hint">同一任务，agent 改写成在 sandbox 里跑 3 个 Python 脚本，数据加工留在沙箱、context 只见结论。</p>
+    <div id="after-trace" class="trace"></div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ⑥ 12 工具命运 ─────────────────── -->
+<section id="fate" class="section alt">
+  <div class="wrap">
+    <h2><span class="num">⑥</span>12 个工具的命运</h2>
+    <p class="intro">workshop 让学员对每个工具决定四件事之一：保留 / 改代码执行 / 改 skill / 删掉。点击表头可以过滤。</p>
+    <div id="fate-filter" class="fate-filter"></div>
+    <table class="fate-table" id="fate-table"></table>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ⑦ 业务策略搬家 ─────────────────── -->
+<section id="policy" class="section">
+  <div class="wrap">
+    <h2><span class="num">⑦</span>业务策略从哪儿搬到哪儿</h2>
+    <p class="intro">
+      <strong>知识总量没缩水。</strong>402 行的 prompt 变成 15 行 prompt + 约 400 行 skill。
+      区别在于"什么时候进 context"。下表列出每条业务策略在两套架构里的位置。
+    </p>
+    <div id="policy-map" class="policy-map"></div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ⑧ 四条原则 ─────────────────── -->
+<section id="principles" class="section dark">
+  <div class="wrap">
+    <h2><span class="num">⑧</span>四条贯穿全程的设计原则</h2>
+    <p class="intro">如果你只能从这套 workshop 带走四句话，是这四句。</p>
+    <div class="principles">
+      <article class="pr-card">
+        <div class="pr-num">1</div>
+        <h3>Compute-over-context</h3>
+        <p>当你需要遍历/聚合数据时，<strong>让代码在沙箱里跑</strong>，只把结论放进 context。
+        Before agent 把 ~400 行 <code>list_low_stock</code> CSV 全塞回上下文；After agent 一个脚本算完只输出 20 行 JSON。</p>
+        <p class="ref">在 forecasting/SKILL.md 体现为：<code>batch_days_of_cover.py</code> 替代 100+ 工具调用。</p>
+      </article>
+      <article class="pr-card">
+        <div class="pr-num">2</div>
+        <h3>Typed contract</h3>
+        <p>当一个 subagent 的输出会被另一个 agent 消费，<strong>必须是结构化 JSON，而不是散文</strong>。
+        每个字段都要有下游消费者。</p>
+        <p class="ref">F2 任务 v1 失败的根因：subagent 散文里说"促销可能 3 倍"，主 agent 落到 PO 还是基线均值。
+        v2 的 forecaster 返回 <code>{forecast_qty, confidence, method, flags}</code>。</p>
+      </article>
+      <article class="pr-card">
+        <div class="pr-num">3</div>
+        <h3>Policy-as-skill</h3>
+        <p>所有"如果 X 就 Y"的业务规则放进 skill 文件，<strong>按需加载</strong>而不是常驻 prompt。
+        Skill description 列触发关键词，agent 在每轮决定是否拉入。</p>
+        <p class="ref">补货公式、供应商打分权重、Slack 模板、周报结构——全部从 prompt 搬到 5 个 SKILL.md。</p>
+      </article>
+      <article class="pr-card">
+        <div class="pr-num">4</div>
+        <h3>Scope discipline</h3>
+        <p>Subagent 只在<strong>真的需要独立 context</strong>时使用——比如要看完整 90 天历史。
+        如果输出是一个数字、或就是个排序，那不该是 subagent。</p>
+        <p class="ref">v1 有 3 个 subagent（forecaster / procurement / writing）；
+        v2 只留 1 个（forecaster），其它两个被打回了"代码执行"和"模板填充"。</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ⑨ F1 任务对比 ─────────────────── -->
+<section id="f1" class="section">
+  <div class="wrap">
+    <h2><span class="num">⑨</span>F1 任务：同一题，两套解法</h2>
+    <p class="intro">
+      F1 = "每日低库存巡检：把当前低于补货点的所有 SKU 按紧迫度排出来，并对前 10 个做出动作（下单或升级）。"
+      点 ▶ 同时跑两边，看时间线和 token 消耗。
+    </p>
+
+    <div class="f1-controls">
+      <button id="f1-play" class="btn primary">▶ 同步播放</button>
+      <button id="f1-reset" class="btn">↺ 重置</button>
+      <label class="speed">速度 <input id="f1-speed" type="range" min="1" max="10" value="5"/></label>
+    </div>
+
+    <div class="f1-grid">
+      <div class="f1-col">
+        <h3>Before · v1</h3>
+        <div class="f1-stats"><span>步骤 <b id="f1-b-step">0</b>/<span id="f1-b-total">0</span></span><span>耗时 <b id="f1-b-time">0</b>s</span><span>Tokens <b id="f1-b-tok">0</b></span></div>
+        <div id="f1-before" class="f1-track"></div>
+      </div>
+      <div class="f1-col">
+        <h3>After · v2</h3>
+        <div class="f1-stats"><span>步骤 <b id="f1-a-step">0</b>/<span id="f1-a-total">0</span></span><span>耗时 <b id="f1-a-time">0</b>s</span><span>Tokens <b id="f1-a-tok">0</b></span></div>
+        <div id="f1-after" class="f1-track"></div>
+      </div>
+    </div>
+
+    <p class="hint">动画里的步数和 token 估算来自 workshop README 给出的实测均值（102 次调用、488 秒）。<br/>
+    模型每次调用 token 数为示意，单位为 1k token 量级。</p>
+  </div>
+</section>
+
+
+<!-- ─────────────────── ⑩ Takeaway ─────────────────── -->
+<section id="takeaway" class="section alt">
+  <div class="wrap">
+    <h2><span class="num">⑩</span>给你的 takeaway</h2>
+
+    <div class="takeaway">
+      <article>
+        <h3>如果你是<strong>供应链/运营</strong></h3>
+        <ul>
+          <li>真正影响产出的不是"agent 用了哪个模型"，而是<strong>业务规则被如何表达</strong>——是塞在 prompt 里，还是组成一组可单测的小文件？</li>
+          <li>"自动下单 vs 升级人工"的边界要被写成<strong>明确阈值</strong>（这里是 <code>confidence &lt; 0.6</code>），而不是"凭感觉"。这是审计可解释性的根。</li>
+          <li>常见陷阱：促销月仍用滚动均值——你的 agent 也会犯。把促销路径和常规路径<strong>显式分流</strong>（路径 A / 路径 B）。</li>
+          <li>评估 ROI 不是看模型分数，而是看具体业务事件能否被准时捕获——比如"top-100 SKU 在断货前 24h 是否被告警"。这才是 F1 任务的灵魂。</li>
+        </ul>
+      </article>
+      <article>
+        <h3>如果你是<strong>IT/Agent 开发</strong></h3>
+        <ul>
+          <li>不要把所有能力都做成 tool call。看到工具返回 &gt; 2k tokens、或 prompt 里写"always do X before Y"，就是该拆 skill / 代码执行的信号。</li>
+          <li>Subagent 之间的接口<strong>强类型 JSON</strong>，不要让主 agent 解析散文——那是 v1 失败的根因。</li>
+          <li>降级路径设计：当某能力不可用（如 callable_agents 在某些环境没启用），返回一个<strong>刻意保守</strong>的占位结果（confidence=0.55），让下游阈值自动接住。skill 之间不要硬连，<strong>通过阈值耦合</strong>。</li>
+          <li>评估闭环比架构本身更值钱。这个 repo 有 12 个 eval 任务，每个对一个具体业务事件；你的 agent 也应该有。</li>
+        </ul>
+      </article>
+    </div>
+
+    <p class="footer-note">
+      所有数字与代码引用自此仓库：<code>agents/before/</code>、<code>agents/starter/</code>、<code>.claude/skills/</code>、<code>README.md</code>。
+      想看任意一段对应的真实代码，从 README 的"What's in here"开始最快。
+    </p>
+  </div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>
